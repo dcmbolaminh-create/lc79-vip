@@ -1,111 +1,148 @@
-const express = require("express");
-const axios = require("axios");
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const { duDoanTaiXiu } = require('./thuattoan');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const API_URL = "http://160.250.247.143:9000/api";
+app.use(cors());
+app.use(express.json());
 
-// ====== CONFIG ======
+// ===== CONFIG =====
 const ADMIN = "@vanminh2603";
-let history = []; // lưu 50 phiên
 
-// ====== PHÂN TÍCH CẦU ======
-function analyzePattern(data) {
-    if (data.length < 5) return "random";
-
-    const last = data.slice(-5).map(x => x.result);
-
-    // cầu bệt
-    if (last.every(x => x === "chan")) return "bet_chan";
-    if (last.every(x => x === "le")) return "bet_le";
-
-    // cầu 1-1
-    let zigzag = true;
-    for (let i = 1; i < last.length; i++) {
-        if (last[i] === last[i - 1]) zigzag = false;
-    }
-
-    if (zigzag) {
-        return last[last.length - 1] === "chan" ? "bet_le" : "bet_chan";
-    }
-
-    return "random";
-}
-
-// ====== AI DỰ ĐOÁN ======
-function predict(history) {
-    const pattern = analyzePattern(history);
-
-    if (pattern === "bet_chan") return "chan";
-    if (pattern === "bet_le") return "le";
-
-    // fallback random nhẹ
-    return Math.random() > 0.5 ? "chan" : "le";
-}
-
-// ====== CALL API ======
-async function getData() {
+// ===== HELPER =====
+async function getSessions(url) {
     try {
-        const res = await axios.get(API_URL, { timeout: 10000 });
-        return res.data;
-    } catch {
-        return null;
+        const res = await axios.get(url, {
+            timeout: 10000,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        return res.data?.list || [];
+    } catch (error) {
+        console.error(`❌ Lỗi API ${url}:`, error.message);
+        return [];
     }
 }
 
-// ====== API CHÍNH ======
-app.get("/api", async (req, res) => {
-    const data = await getData();
+// ===== FORMAT RESPONSE =====
+function formatData(latest, history) {
+    const dices = latest?.dices || [0, 0, 0];
+    const duDoan = duDoanTaiXiu(history);
 
-    let phien = Date.now();
-    let result = Math.random() > 0.5 ? "chan" : "le";
-
-    if (data) {
-        phien = data.phien || data.round || phien;
-        result = data.ket_qua || result;
-    }
-
-    // lưu lịch sử
-    history.push({ phien, result });
-    if (history.length > 50) history.shift();
-
-    const duDoan = predict(history);
-
-    // fake xúc xắc
-    const xucXac = [
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang"
-    ];
-
-    const soDo = xucXac.filter(x => x === "do").length;
-    const soTrang = 3 - soDo;
-
-    res.json({
-        success: true,
+    return {
         admin: ADMIN,
-        phien_hien_tai: phien,
-        du_doan: duDoan,
-        lich_su: history,
-        pattern: analyzePattern(history),
-        du_doan_xuc_xac: xucXac,
-        cua_dat:
-            soDo === 3 ? "3_do" :
-            soTrang === 3 ? "3_trang" :
-            soDo === 2 ? "2_do_1_trang" :
-            "1_do_2_trang",
-        so_do: soDo,
-        so_trang: soTrang
+        phien: Number(latest?.id || 0),
+        xuc_xac_1: dices[0],
+        xuc_xac_2: dices[1],
+        xuc_xac_3: dices[2],
+        tong: Number(latest?.point || 0),
+        ket_qua: latest?.resultTruyenThong || "Chưa có",
+        phien_hien_tai: Number(latest?.id || 0) + 1,
+        du_doan: duDoan.prediction,
+        do_tin_cay: duDoan.confidence,
+        pattern: duDoan.pattern,
+        reason: duDoan.reason,
+        recommend: duDoan.recommend
+    };
+}
+
+// ==================== MD5 ====================
+app.get('/taixiumd5', async (req, res) => {
+    try {
+        const sessions = await getSessions('https://wtxmd52.tele68.com/v1/txmd5/sessions');
+
+        if (!sessions.length) {
+            return res.status(500).json({
+                admin: ADMIN,
+                error: "Không lấy được dữ liệu MD5"
+            });
+        }
+
+        const latest = sessions[0];
+        const history = sessions.map(s => s.resultTruyenThong || "");
+
+        res.json(formatData(latest, history));
+
+    } catch (err) {
+        res.status(500).json({
+            admin: ADMIN,
+            error: "Lỗi server MD5"
+        });
+    }
+});
+
+// ==================== TÀI XỈU ====================
+app.get('/taixiu', async (req, res) => {
+    try {
+        const sessions = await getSessions('https://wtx.tele68.com/v1/tx/sessions');
+
+        if (!sessions.length) {
+            return res.status(500).json({
+                admin: ADMIN,
+                error: "Không lấy được dữ liệu Tài Xỉu"
+            });
+        }
+
+        const latest = sessions[0];
+        const history = sessions.map(s => s.resultTruyenThong || "");
+
+        res.json(formatData(latest, history));
+
+    } catch (err) {
+        res.status(500).json({
+            admin: ADMIN,
+            error: "Lỗi server Tài Xỉu"
+        });
+    }
+});
+
+// ==================== BOTH ====================
+app.get('/both', async (req, res) => {
+    try {
+        const [md5Sessions, txSessions] = await Promise.all([
+            getSessions('https://wtxmd52.tele68.com/v1/txmd5/sessions'),
+            getSessions('https://wtx.tele68.com/v1/tx/sessions')
+        ]);
+
+        const md5Latest = md5Sessions[0] || {};
+        const txLatest = txSessions[0] || {};
+
+        const md5History = md5Sessions.map(s => s.resultTruyenThong || "");
+        const txHistory = txSessions.map(s => s.resultTruyenThong || "");
+
+        res.json({
+            admin: ADMIN,
+            success: true,
+            timestamp: new Date().toISOString(),
+            taixiumd5: formatData(md5Latest, md5History),
+            taixiu: formatData(txLatest, txHistory)
+        });
+
+    } catch (err) {
+        res.status(500).json({
+            admin: ADMIN,
+            success: false,
+            error: "Lỗi lấy dữ liệu BOTH"
+        });
+    }
+});
+
+// ==================== ROOT ====================
+app.get('/', (req, res) => {
+    res.json({
+        admin: ADMIN,
+        message: "🚀 API Tài Xỉu VIP PRO MAX",
+        endpoints: {
+            "/taixiumd5": "MD5",
+            "/taixiu": "Tài Xỉu",
+            "/both": "Cả hai"
+        }
     });
 });
 
-// ====== ROUTE CHECK ======
-app.get("/", (req, res) => {
-    res.send("🚀 API SOI CẦU VIP RUNNING - ADM " + ADMIN);
-});
-
-// ====== START ======
+// ==================== START ====================
 app.listen(PORT, () => {
-    console.log("🔥 Server chạy tại port " + PORT);
+    console.log(`🚀 Server chạy: http://localhost:${PORT}`);
 });
